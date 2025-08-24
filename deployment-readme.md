@@ -1,7 +1,3 @@
-
-
-
-
 # Deployment 
 - Always use Staging SSL for deployment. after all is ready then swithc to production SSL
 - Ensure deploying node has minimum 8Gb ram to build and push
@@ -56,6 +52,11 @@ EOF
 - in jenkinfile ensure to remove the line below because the deployment will read secret directly from k8s envrionment
 kubectl apply -n "${NS}" -f k8s/gibbon-mysql-secret.yaml
 
+- (Optional) check after rollout or deploy
+APP_POD=$(kubectl -n gibbon-dev-deploy get pod -l app=gibbon-dev -o jsonpath='{.items[0].metadata.name}')
+kubectl -n gibbon-dev-deploy exec "$APP_POD" -c gibbon -- \
+  sh -lc 'env | egrep "^DB_(HOST|PORT|NAME|USER|PASS|PASSWORD|CHARSET)="'
+  
 ## 4. Deploy
 - modify all other parameter so that deployment is dedicated to a system (the example is gibbon-dev.vanhoa.edu.vn)
 
