@@ -1,3 +1,7 @@
+
+
+
+
 # Deployment 
 - Always use Staging SSL for deployment. after all is ready then swithc to production SSL
 - Ensure deploying node has minimum 8Gb ram to build and push
@@ -20,13 +24,68 @@ NS=gibbon-dev-deploy
 kubectl -n "$NS" create secret generic gibbon-dev-openai \
   --from-literal=OPENAI_API_KEY='sk-...your-key...'
 kubectl -n "$NS" patch secret gibbon-dev-openai -p '{"immutable":true}'
-key rotation
+- key rotation
 kubectl -n "$NS" delete secret gibbon-dev-openai
 kubectl -n "$NS" create secret generic gibbon-dev-openai \
   --from-literal=OPENAI_API_KEY='sk-...new...' 
 
 - if deployment is running
 kubectl -n "$NS" rollout restart deployment/gibbon-dev-app
+** Tests - execute in k8s master node: 
+#!/usr/bin/env bash
+set -eu
+
+NS="gibbon-dev-deploy"
+SEC="gibbon-dev-openai"
+
+echo "[1] Secret tail from API (masked):"
+kubectl -n "${NS}" get secret "${SEC}" -o jsonpath='{.data.OPENAI_API_KEY}' \
+  | base64 -d \
+  | awk '{print substr($0,1,6)"…"(length>4?substr($0,length-3):$0)}'; echo
+
+echo "[2] Pods using the secret:"
+PODS="$(kubectl -n "${NS}" get pod -l app=gibbon-dev -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}')"
+for p in ${PODS}; do
+  echo " - ${p}:"
+
+  echo "   Secret file in pod:"
+  kubectl -n "${NS}" exec "${p}" -c gibbon -- sh -lc '
+    set -eu
+    ls -l /run/secrets/openai || true
+    if [ -f /run/secrets/openai/OPENAI_API_KEY ]; then
+      head -c 6 /run/secrets/openai/OPENAI_API_KEY; echo -n "…"; tail -c 4 /run/secrets/openai/OPENAI_API_KEY; echo
+    else
+      echo "(missing)"
+    fi
+  '
+
+  echo "   Apache env (should NOT contain OPENAI_API_KEY):"
+  kubectl -n "${NS}" exec "${p}" -c gibbon -- sh -lc '
+    set -eu
+    PID=$(pgrep -xo apache2 || pgrep -xo httpd || true)
+    if [ -n "${PID:-}" ]; then
+      tr "\0" "\n" < /proc/$PID/environ | grep "^OPENAI_API_KEY=" || echo "(none)"
+    else
+      echo "(apache not found)"
+    fi
+  '
+
+  echo "   PHP getApiKey() last4 (via openai.php):"
+  kubectl -n "${NS}" exec "${p}" -c gibbon -- sh -lc \
+    'php -r '\''require "/var/www/html/gibbon/openai.php"; $k=getApiKey(false); echo $k?substr($k,-4):"MISSING";'\''; echo'
+done
+
+
+*** important note: if the test still show mismatch new - old key. do the following step to completely refesh the key
+NS=gibbon-dev-deploy
+- Scale to zero to terminate *all* pods (and any stragglers from old ReplicaSets)
+kubectl -n "$NS" scale deploy/gibbon-dev-app --replicas=0
+kubectl -n "$NS" wait --for=delete pod -l app=gibbon-dev --timeout=180s
+
+- Scale back up
+kubectl -n "$NS" scale deploy/gibbon-dev-app --replicas=1
+kubectl -n "$NS" rollout status deploy/gibbon-dev-app --timeout=300s
+
 
 ## 3. Create secret for database  (for server side and php code usage)
 - change the detail below as needed (metadatas, string data)
@@ -56,9 +115,89 @@ kubectl apply -n "${NS}" -f k8s/gibbon-mysql-secret.yaml
 APP_POD=$(kubectl -n gibbon-dev-deploy get pod -l app=gibbon-dev -o jsonpath='{.items[0].metadata.name}')
 kubectl -n gibbon-dev-deploy exec "$APP_POD" -c gibbon -- \
   sh -lc 'env | egrep "^DB_(HOST|PORT|NAME|USER|PASS|PASSWORD|CHARSET)="'
-  
+
 ## 4. Deploy
 - modify all other parameter so that deployment is dedicated to a system (the example is gibbon-dev.vanhoa.edu.vn)
+### 4.1. recreate config.php
+0) Vars
+NS=gibbon-dev-deploy
+DEP=gibbon-dev-app
+PVC=gibbon-dev-uploads-pvc
+
+1) Scale app down (no writers)
+kubectl -n "$NS" scale deploy/$DEP --replicas=0
+kubectl -n "$NS" wait --for=delete pod -l app=gibbon-dev --timeout=180s
+
+2) Start a tiny helper pod that mounts the same PVC
+kubectl -n "$NS" run pvc-tool --image=busybox:1.36 --restart=Never \
+  --overrides="$(
+    cat <<'JSON'
+{
+  "spec":{
+    "volumes":[{"name":"uploads","persistentVolumeClaim":{"claimName":"gibbon-dev-uploads-pvc"}}],
+    "containers":[{"name":"sh","image":"busybox:1.36","command":["sh","-c","sleep 3600"],
+      "volumeMounts":[{"name":"uploads","mountPath":"/pvc"}]}]
+  }
+}
+JSON
+)"
+kubectl -n "$NS" wait pod pvc-tool --for=condition=Ready --timeout=60s
+
+3) Delete the file from the PVC
+kubectl -n "$NS" exec pvc-tool -- sh -lc 'rm -f /pvc/config/config.php && ls -l /pvc/config || true'
+
+4) Temporarily change the Deployment so it doesn’t require or recreate config.php
+
+Remove the config.php volumeMount (it’s the 2nd mount on the container in your YAML).
+
+Disable the part of the init-container that auto-creates config.php.
+
+4a) remove the config.php volumeMount
+kubectl -n "$NS" patch deploy/$DEP --type=json -p='[
+ {"op":"remove","path":"/spec/template/spec/containers/0/volumeMounts/1"}
+]'
+
+4b) replace init script so it skips creating config.php
+kubectl -n "$NS" patch deploy/$DEP --type=json -p="$(
+  python3 - <<'PY'
+import json,sys
+script = r'''set -ex
+mkdir -p /pvc/config /pvc/i18n /var/www/html/gibbon/uploads/tmp /var/www/html/gibbon/uploads/cache
+- (installer mode) DO NOT create /pvc/config/config.php here
+chown -R 33:33 /var/www/html/gibbon/uploads || true
+chmod -R 0777 /var/www/html/gibbon/uploads || true
+'''
+print(json.dumps([
+  {"op":"replace","path":"/spec/template/spec/initContainers/0/args/0","value":script}
+]))
+PY
+)"
+
+5) Scale up and run the installer
+kubectl -n "$NS" scale deploy/$DEP --replicas=1
+kubectl -n "$NS" rollout status deploy/$DEP --timeout=300s
+
+Now open https://gibbon-dev.vanhoa.edu.vn/installer/ and complete the steps.
+The installer will write /var/www/html/gibbon/config.php inside the pod filesystem.
+
+6) Persist that config.php back into the PVC
+APP_POD=$(kubectl -n "$NS" get pod -l app=gibbon-dev -o jsonpath='{.items[0].metadata.name}')
+
+- copy file contents from app pod into PVC via the helper
+kubectl -n "$NS" exec "$APP_POD" -c gibbon -- sh -lc 'cat /var/www/html/gibbon/config.php' \
+ | kubectl -n "$NS" exec pvc-tool -- sh -lc 'mkdir -p /pvc/config && cat > /pvc/config/config.php && chown 33:33 /pvc/config/config.php && chmod 660 /pvc/config/config.php'
+
+7) Restore your Deployment to “normal”
+
+Easiest: re-apply your canonical YAML (the one in Git/Jenkins) so the original init script and the config.php volumeMount come back:
+
+kubectl -n "$NS" apply -f k8s/gibbon-deployment.yaml
+kubectl -n "$NS" rollout status deploy/$DEP --timeout=300s
+
+(If you prefer patches instead of re-applying YAML, you can add the volumeMount back and replace the init args with the original block, but re-applying your file is simpler and source-of-truth-friendly.)
+
+8) Clean up helper
+kubectl -n "$NS" delete pod pvc-tool --ignore-not-found
 
 ## 5. restore database 
 - create new database if not avalable
@@ -68,52 +207,53 @@ kubectl -n gibbon-dev-deploy exec "$APP_POD" -c gibbon -- \
 - ensure file exist 
 ls -lh /root/gibbon_2025_8_14.sql
 set -eu
-DB_HOST="gibbon-dev-mysql.gibbon-dev-deploy.svc.cluster.local"
+-  Vars
+NS="gibbon-dev-deploy"
 DB_NAME="gibbon"
 DB_USER="gibbonuser"
 DB_PASS="gibbonpass123"
-DB_PORT=3306
-MYSQL_ROOT_PASSWORD="gibbonpass123"
 
-NS=gibbon-dev-deploy
+- Stop the app so it doesn't write during restore
+kubectl -n "$NS" scale deploy/gibbon-dev-app --replicas=0
+kubectl -n "$NS" wait --for=delete pod -l app=gibbon-dev --timeout=180s
+
+- Find MySQL pod
 MYSQL_POD=$(kubectl -n "$NS" get pod -l app=gibbon-dev-mysql \
   -o jsonpath='{.items[0].metadata.name}')
-echo "MYSQL_POD=${MYSQL_POD}"
-kubectl -n "$NS" exec -it "$MYSQL_POD" -c mysql -- bash -lc '
-set -eu
-mysql -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
-  CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-  CREATE USER IF NOT EXISTS \"$DB_USER\"@\"%\" IDENTIFIED BY \"$DB_PASS\";
-  ALTER USER \"$DB_USER\"@\"%\" IDENTIFIED BY \"$DB_PASS\";
-  GRANT ALL PRIVILEGES ON \`gibbon\`.* TO \"$DB_USER\"@\"%\";
-  FLUSH PRIVILEGES;
-  SELECT user,host FROM mysql.user WHERE user=\"$DB_USER\";
-"'
+echo "MYSQL_POD=$MYSQL_POD"
 
-- verify
-APP_POD=$(kubectl -n "$NS" get pods -l app=gibbon-dev \
-  -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk "NR==1{print}")
-kubectl -n "$NS" exec -it "$APP_POD" -c gibbon -- bash -lc '
-DB_HOST="gibbon-dev-mysql.gibbon-dev-deploy.svc.cluster.local"
-DB_NAME="gibbon"
-DB_USER="gibbonuser"
-DB_PASS="gibbonpass123"
-DB_PORT=3306
-MYSQL_PWD="$DB_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -e "SELECT 1;"
-'
+ 1) Drop & recreate the DB using the app user
+kubectl -n "$NS" exec -it "$MYSQL_POD" -c mysql -- bash -lc "
+  set -eu
+  export MYSQL_PWD='$DB_PASS'
+  mysql -h 127.0.0.1 -P 3306 -u '$DB_USER' -e \"
+    DROP DATABASE IF EXISTS \\\`$DB_NAME\\\`;
+    CREATE DATABASE \\\`$DB_NAME\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  \"
+"
 
-- copy dump file and restore dump
-kubectl -n "$NS" cp /root/gibbon_2025_8_14.sql "$APP_POD":/root/gibbon_2025_8_14.sql -c gibbon
+ 2) Copy dump into the MySQL pod and import
+kubectl -n "$NS" cp /root/gibbon_2025_8_14.sql "$MYSQL_POD":/tmp/gibbon_2025_8_14.sql -c mysql
 
+kubectl -n "$NS" exec -it "$MYSQL_POD" -c mysql -- bash -lc "
+  set -eu
+  export MYSQL_PWD='$DB_PASS'
+  mysql --default-character-set=utf8mb4 \
+    -h 127.0.0.1 -P 3306 -u '$DB_USER' '$DB_NAME' < /tmp/gibbon_2025_8_14.sql
+  mysql -h 127.0.0.1 -P 3306 -u '$DB_USER' '$DB_NAME' -e \"
+    SHOW TABLES;
+    SELECT COUNT(*) AS people FROM gibbonPerson;
+  \"
+"
 
-kubectl -n "$NS" exec -it "$APP_POD" -c gibbon -- bash -lc '
-DB_HOST="gibbon-dev-mysql.gibbon-dev-deploy.svc.cluster.local"
-DB_NAME="gibbon"
-DB_USER="gibbonuser"
-DB_PASS="gibbonpass123"
-DB_PORT=3306
-MYSQL_PWD="$DB_PASS" mysql --default-character-set=utf8mb4 \
-  -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" < /root/gibbon_2025_8_14.sql
-MYSQL_PWD="$DB_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" \
-  -e "SHOW TABLES; SELECT COUNT(*) AS people FROM gibbonPerson;"
-'
+ 3) Bring the app back
+kubectl -n "$NS" scale deploy/gibbon-dev-app --replicas=1
+kubectl -n "$NS" rollout status deploy/gibbon-dev-app --timeout=300s
+
+- IF drop fails. Check the privileges your app user has:
+kubectl -n "$NS" exec -it "$MYSQL_POD" -c mysql -- bash -lc "
+  export MYSQL_PWD='$DB_PASS'
+  mysql -h 127.0.0.1 -P 3306 -u '$DB_USER' -e \"SHOW GRANTS FOR '$DB_USER'@'%';\"
+"
+GRANT ALL PRIVILEGES ON `gibbon`.* TO 'gibbonuser'@'%';
+FLUSH PRIVILEGES;
