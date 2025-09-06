@@ -1,0 +1,113 @@
+# this set up is to allow remote access to mysql database through VPN tailscale
+
+1) Fix ACLs (single tag only)
+
+Replace your ACL JSON with this (only change: use tag:k8s-operator everywhere; you can drop the unused tag:k8s owner line if you like):
+
+{
+  "groups": {
+    "group:admins": ["ntony3419@github"]
+  },
+  "tagOwners": {
+    "tag:k8s-operator": ["group:admins", "autogroup:admin"]
+  },
+  "grants": [
+    { "src": ["group:admins"], "dst": ["tag:k8s-operator"], "ip": ["tcp:3306"] }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:self"],
+      "users": ["autogroup:nonroot", "root"]
+    }
+  ]
+}
+
+
+Save in the Tailscale admin → ACL. (No second tag is needed.)
+
+2) Reconfigure the operator to use tag:k8s-operator
+
+You already exported the OAuth env vars. Run:
+
+# (re)configure operator to stamp devices with tag:k8s-operator
+helm upgrade --install tailscale-operator tailscale/tailscale-operator \
+  -n tailscale \
+  --set oauth.clientId="$TS_OAUTH_CLIENT_ID" \
+  --set oauth.clientSecret="$TS_OAUTH_CLIENT_SECRET" \
+  --set proxyConfig.defaultTags='tag:k8s-operator'
+
+kubectl -n tailscale rollout status deploy/operator
+
+3) Annotate the MySQL Service for Tailscale exposure
+
+We’ll expose the existing Service (as your logs show it’s named gibbon-dev-mysql in gibbon-dev-deploy). These annotations instruct the operator to create a Tailscale proxy with the hostname gibbon-dev-db and the tag k8s-operator.
+
+# Ensure the service exists & is 3306
+kubectl -n gibbon-dev-deploy get svc gibbon-dev-mysql -o wide
+
+# Add/overwrite Tailscale annotations (safe to re-run)
+kubectl -n gibbon-dev-deploy annotate svc gibbon-dev-mysql \
+  tailscale.com/expose="true" \
+  tailscale.com/hostname="gibbon-dev-db" \
+  tailscale.com/tags="tag:k8s-operator" \
+  --overwrite
+
+# Watch operator logs until you see ProxyReady=True
+kubectl -n tailscale logs deploy/operator -f | egrep -i 'gibbon-dev-mysql|TailscaleProxyReady|error|fatal'
+
+
+The operator will create a ts-... proxy Pod in the tailscale namespace. Once ready, a new device named gibbon-dev-db appears in your Tailscale admin.
+
+Note: we are not opening 3306 on your public IP (your earlier nc showed “closed” — that’s good). Access is Tailscale-only.
+
+4) Connect from MySQL Workbench (stable forever)
+
+On any device logged into your tailnet with permission (you in group:admins):
+
+Host: gibbon-dev-db (MagicDNS on)
+or gibbon-dev-db.<your-tailnet>.ts.net
+
+Port: 3306
+
+User/Password: your MySQL creds
+
+SSL: enable if your MySQL server is TLS-enabled
+
+This stays stable across app rollouts and DB pod restarts. The Service and Tailscale hostname don’t change.
+
+5) Reroll the operator’s API key secret (if needed)
+
+If you ever see stale/invalid-key errors or you change tags again, force the operator to mint a fresh API key and proxy:
+
+# Find the per-proxy secret/operator API key secrets that mention your service
+kubectl -n tailscale get secret | grep -E 'ts|gibbon|mysql' || true
+
+# Delete any secrets tied to the gibbon-dev-mysql proxy (safe to recreate)
+# Example (adjust NAME):
+kubectl -n tailscale delete secret <SECRET_NAME>
+
+# Restart the operator and clear proxy pods to re-provision cleanly
+kubectl -n tailscale rollout restart deploy/operator
+kubectl -n tailscale delete pod -l tailscale.com/proxyService="gibbon-dev-deploy/gibbon-dev-mysql" --ignore-not-found
+
+# Watch for readiness
+kubectl -n tailscale logs deploy/operator -f | egrep -i 'gibbon-dev-mysql|TailscaleProxyReady|error|fatal'
+
+6) (Optional) Pin the Service spec for clarity
+
+If your Service didn’t already have a proper 3306 port, use this drop-in (idempotent) patch to ensure the port is named and correct:
+
+kubectl -n gibbon-dev-deploy patch svc gibbon-dev-mysql --type='json' -p='[
+  {"op":"replace","path":"/spec/ports/0","value":{"name":"mysql","port":3306,"targetPort":3306}}
+]'
+
+Sanity checks
+# From any Tailscale-connected machine
+tailscale status | grep gibbon-dev-db || true
+nc -vz gibbon-dev-db 3306
+
+# From cluster side (verifies proxy exists/ready)
+kubectl -n tailscale get pods -l tailscale.com/proxyService="gibbon-dev-deploy/gibbon-dev-mysql" -o wide
+kubectl -n tailscale logs deploy/operator | tail -n 50
