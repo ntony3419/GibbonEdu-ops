@@ -119,16 +119,20 @@ kubectl -n gibbon-dev-deploy exec "$APP_POD" -c gibbon -- \
 ## 4. Deploy
 - modify all other parameter so that deployment is dedicated to a system (the example is gibbon-dev.vanhoa.edu.vn)
 ### 4.1. recreate config.php
-0) Vars
-NS=gibbon-dev-deploy
-DEP=gibbon-dev-app
-PVC=gibbon-dev-uploads-pvc
+#!/usr/bin/env bash
+set -euo pipefail
 
-1) Scale app down (no writers)
+ --- Vars (dev) ---
+NS="gibbon-dev-deploy"
+DEP="gibbon-dev-app"
+PVC="gibbon-dev-uploads-pvc"
+
+echo "== 1) Scale app down =="
 kubectl -n "$NS" scale deploy/$DEP --replicas=0
-kubectl -n "$NS" wait --for=delete pod -l app=gibbon-dev --timeout=180s
+kubectl -n "$NS" wait --for=delete pod -l app=gibbon-dev --timeout=180s || true
 
-2) Start a tiny helper pod that mounts the same PVC
+echo "== 2) Start a helper pod that mounts the same PVC =="
+kubectl -n "$NS" delete pod pvc-tool --ignore-not-found
 kubectl -n "$NS" run pvc-tool --image=busybox:1.36 --restart=Never \
   --overrides="$(
     cat <<'JSON'
@@ -143,61 +147,90 @@ JSON
 )"
 kubectl -n "$NS" wait pod pvc-tool --for=condition=Ready --timeout=60s
 
-3) Delete the file from the PVC
+echo "== 3) Delete config.php from PVC =="
 kubectl -n "$NS" exec pvc-tool -- sh -lc 'rm -f /pvc/config/config.php && ls -l /pvc/config || true'
 
-4) Temporarily change the Deployment so it doesn’t require or recreate config.php
+echo "== 4a) Temporarily remove the config.php subPath volumeMount from the app container =="
+- Replace the volumeMounts list with the same mounts but WITHOUT the config.php subPath.
+- (Keeps uploads + i18n + openai-secret).
+kubectl -n "$NS" patch deploy/$DEP --type=merge -p='
+spec:
+  template:
+    spec:
+      containers:
+      - name: gibbon
+        volumeMounts:
+        - name: uploads
+          mountPath: /var/www/html/gibbon/uploads
+        - name: uploads
+          mountPath: /var/www/html/gibbon/i18n
+          subPath: i18n
+        - name: openai-secret
+          mountPath: /run/secrets/openai
+          readOnly: true
+'
 
-Remove the config.php volumeMount (it’s the 2nd mount on the container in your YAML).
-
-Disable the part of the init-container that auto-creates config.php.
-
-4a) remove the config.php volumeMount
-kubectl -n "$NS" patch deploy/$DEP --type=json -p='[
- {"op":"remove","path":"/spec/template/spec/containers/0/volumeMounts/1"}
-]'
-
-4b) replace init script so it skips creating config.php
+echo "== 4b) Replace init script to SKIP creating config.php (note the # comment, no leading '-') =="
+- Only adjust the first initContainer args[0], keeping the rest of the pod spec intact.
+PATCH_SCRIPT=$'set -ex\nmkdir -p /pvc/config /pvc/i18n /var/www/html/gibbon/uploads/tmp /var/www/html/gibbon/uploads/cache\n# installer mode: DO NOT create /pvc/config/config.php here\nchown -R 33:33 /var/www/html/gibbon/uploads || true\nchmod -R 0777 /var/www/html/gibbon/uploads || true\n'
 kubectl -n "$NS" patch deploy/$DEP --type=json -p="$(
   python3 - <<'PY'
-import json,sys
-script = r'''set -ex
-mkdir -p /pvc/config /pvc/i18n /var/www/html/gibbon/uploads/tmp /var/www/html/gibbon/uploads/cache
-- (installer mode) DO NOT create /pvc/config/config.php here
-chown -R 33:33 /var/www/html/gibbon/uploads || true
-chmod -R 0777 /var/www/html/gibbon/uploads || true
-'''
+import json, os
+script = os.environ["PATCH_SCRIPT"]
+print(json.dumps([
+  {"op":"replace","path":"/spec/template/spec/initContainers/0/args/0","value":script}
+]))
+PY
+)" || {
+  echo "JSON patch failed; falling back to direct inline JSON…"
+  kubectl -n "$NS" patch deploy/$DEP --type=json -p="[
+    {\"op\":\"replace\",\"path\":\"/spec/template/spec/initContainers/0/args/0\",
+     \"value\":\"$PATCH_SCRIPT\"}
+  ]"
+}
+
+echo "== 5) Scale up one replica and wait =="
+kubectl -n "$NS" scale deploy/$DEP --replicas=1
+kubectl -n "$NS" rollout status deploy/$DEP --timeout=300s
+
+echo "== 5b) Open the installer in your browser =="
+echo "   https://gibbon-dev.vanhoa.edu.vn/installer/"
+echo "   Complete all steps (the installer writes /var/www/html/gibbon/config.php INSIDE the pod)."
+read -p "Press Enter AFTER you finish the web installer…"
+
+echo "== 6) Persist the generated config.php into the PVC =="
+APP_POD="$(kubectl -n "$NS" get pod -l app=gibbon-dev -o jsonpath='{.items[0].metadata.name}')"
+kubectl -n "$NS" exec "$APP_POD" -c gibbon -- sh -lc 'cat /var/www/html/gibbon/config.php' \
+ | kubectl -n "$NS" exec pvc-tool -- sh -lc 'mkdir -p /pvc/config && cat > /pvc/config/config.php && chown 33:33 /pvc/config/config.php && chmod 660 /pvc/config/config.php'
+kubectl -n "$NS" exec pvc-tool -- sh -lc 'ls -l /pvc/config/config.php && head -n 3 /pvc/config/config.php || true'
+
+echo "== 7) Restore Deployment to normal (re-add config.php subPath and original init args) =="
+- Re-add the config.php subPath mount
+kubectl -n "$NS" patch deploy/$DEP --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/2",
+   "value":{"name":"uploads","mountPath":"/var/www/html/gibbon/config.php","subPath":"config/config.php","readOnly":true}}
+]'
+
+- Restore the original init script that creates config.php if missing (your canonical settings)
+ORIG_INIT=$'set -ex\nmkdir -p /pvc/config /pvc/i18n \\\n         /var/www/html/gibbon/uploads/tmp /var/www/html/gibbon/uploads/cache\n[ -s /pvc/.gibbon_guid ] || (cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N) > /pvc/.gibbon_guid\nif [ ! -s /pvc/config/config.php ]; then\n  printf %s\\\\n \\\n    \\'<?php\\' \\\n    \\'$databaseServer   = getenv(\"DB_HOST\");\\' \\\n    \\'$databaseUsername = getenv(\"DB_USER\");\\' \\\n    \\'$databasePassword = getenv(\"DB_PASSWORD\");\\' \\\n    \\'$databaseName     = getenv(\"DB_NAME\");\\' \\\n    \\'$guid = getenv(\"GIBBON_GUID\");\\' \\\n    \\'if (!$guid) {\\' \\\n    \\'  $guidFile = __DIR__ . \"/../.gibbon_guid\";\\' \\\n    \\'  if (is_readable($guidFile)) { $guid = trim(file_get_contents($guidFile)); }\\' \\\n    \\' }\\' \\\n    \\'$caching     = 10;\\' \\\n    \\'$absoluteURL = getenv(\"ABSOLUTE_URL\");\\' \\\n  > /pvc/config/config.php\n  chown 33:33 /pvc/config/config.php || true\n  chmod 0660 /pvc/config/config.php || true\nfi\nchown -R 33:33 /var/www/html/gibbon/uploads || true\nchmod -R 0777 /var/www/html/gibbon/uploads || true\n'
+kubectl -n "$NS" patch deploy/$DEP --type=json -p="$(
+  python3 - <<'PY'
+import json, os
+script = os.environ["ORIG_INIT"]
 print(json.dumps([
   {"op":"replace","path":"/spec/template/spec/initContainers/0/args/0","value":script}
 ]))
 PY
 )"
 
-5) Scale up and run the installer
-kubectl -n "$NS" scale deploy/$DEP --replicas=1
-kubectl -n "$NS" rollout status deploy/$DEP --timeout=300s
+echo "== 7b) Roll the deployment =="
+kubectl -n "$NS" rollout restart deploy/$DEP
+kubectl -n "$NS" rollout status  deploy/$DEP --timeout=300s
 
-Now open https://gibbon-dev.vanhoa.edu.vn/installer/ and complete the steps.
-The installer will write /var/www/html/gibbon/config.php inside the pod filesystem.
-
-6) Persist that config.php back into the PVC
-APP_POD=$(kubectl -n "$NS" get pod -l app=gibbon-dev -o jsonpath='{.items[0].metadata.name}')
-
-- copy file contents from app pod into PVC via the helper
-kubectl -n "$NS" exec "$APP_POD" -c gibbon -- sh -lc 'cat /var/www/html/gibbon/config.php' \
- | kubectl -n "$NS" exec pvc-tool -- sh -lc 'mkdir -p /pvc/config && cat > /pvc/config/config.php && chown 33:33 /pvc/config/config.php && chmod 660 /pvc/config/config.php'
-
-7) Restore your Deployment to “normal”
-
-Easiest: re-apply your canonical YAML (the one in Git/Jenkins) so the original init script and the config.php volumeMount come back:
-
-kubectl -n "$NS" apply -f k8s/gibbon-deployment.yaml
-kubectl -n "$NS" rollout status deploy/$DEP --timeout=300s
-
-(If you prefer patches instead of re-applying YAML, you can add the volumeMount back and replace the init args with the original block, but re-applying your file is simpler and source-of-truth-friendly.)
-
-8) Clean up helper
+echo "== 8) Cleanup helper pod =="
 kubectl -n "$NS" delete pod pvc-tool --ignore-not-found
+
+echo "All done ✅"
 
 ## 5. restore database 
 - create new database if not avalable
@@ -257,3 +290,165 @@ kubectl -n "$NS" exec -it "$MYSQL_POD" -c mysql -- bash -lc "
 "
 GRANT ALL PRIVILEGES ON `gibbon`.* TO 'gibbonuser'@'%';
 FLUSH PRIVILEGES;
+
+## 6. Connect to database within k8s from outside
+### Permanent connection survive all roll out
+****** this method will expose the mysql server. MUST have IP block or any other way to migrate the exposua
+- create an overlay file for ingress-tcp
+cat >/tmp/ingress-tcp-overlay.yaml <<'YAML'
+controller:
+  
+  extraPorts:
+    - name: tcp-3306
+      containerPort: 3306
+      hostPort: 3306
+      protocol: TCP
+    - name: tcp-3307
+      containerPort: 3307
+      hostPort: 3307
+      protocol: TCP
+    - name: tcp-3308
+      containerPort: 3308
+      hostPort: 3308
+      protocol: TCP
+    - name: tcp-3309
+      containerPort: 3309
+      hostPort: 3309
+      protocol: TCP
+tcp:
+  "3306": "gibbon-dev-deploy/gibbon-dev-mysql:3306"
+  "3307": "gibbon-demo-deploy/gibbon-demo-mysql:3306"
+  "3308": "gibbon-banthach-deploy/gibbon-banthach-mysql:3306"
+  "3309": "gibbon-thachcham-deploy/gibbon-thachcham-mysql:3306"
+YAML
+
+Apply it on top of your saved values:
+helm -n ingress-nginx upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+  -f /tmp/ingress-values.yaml \
+  -f /tmp/ingress-tcp-overlay.yaml
+
+kubectl -n ingress-nginx get cm | grep tcp   # should show ingress-nginx-tcp
+kubectl -n ingress-nginx get ds ingress-nginx-controller -o jsonpath='{.spec.template.spec.containers[0].args}'
+kubectl -n ingress-nginx get ds ingress-nginx-controller -o jsonpath='{.spec.template.spec.containers[0].ports}'
+- quick check 
+-- DNS/Ingress back up
+curl -I https://gibbon-dev.vanhoa.edu.vn
+
+-- TCP mapping live from allowed IP
+nc -vz 5.78.68.173 3306
+
+# Trouble shoot
+## loging issue
+NS=gibbon-dev-deploy
+APP_POD=$(kubectl -n "$NS" get pods -l app=gibbon-dev \
+  -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' \
+  | tr " " "\n" | head -n1)
+
+ 1) Force PHP to log to a file in the PVC-backed uploads dir
+kubectl -n "$NS" exec "$APP_POD" -c gibbon -- sh -lc '
+set -eu
+mkdir -p /var/www/html/gibbon/uploads/logs
+chown -R www-data:www-data /var/www/html/gibbon/uploads/logs
+cat > /usr/local/etc/php/conf.d/99-debug.ini <<EOF
+display_errors=On
+error_reporting=E_ALL
+log_errors=On
+error_log=/var/www/html/gibbon/uploads/logs/php-error.log
+EOF
+ 2) Reload Apache IN PLACE (no pod restart) so php.ini is re-read
+apache2ctl -k graceful || true
+- show what PHP is using now
+php -i | grep -E "error_log|display_errors|log_errors"
+'
+
+ 3) In your browser, reproduce the Finance page error ONCE.
+
+ 4) Read the log from the same pod (no -it, so it won’t “hang”)
+kubectl -n "$NS" exec "$APP_POD" -c gibbon -- sh -lc '
+ls -lah /var/www/html/gibbon/uploads/logs || true
+tail -n 200 /var/www/html/gibbon/uploads/logs/php-error.log || true
+'
+## Styling missing issue
+0) Vars
+NS=gibbon-thachcham-deploy
+
+1) Find the MySQL pod
+MYSQL_POD=$(kubectl -n "$NS" get pod -l app=gibbon-thachcham-mysql \
+  -o jsonpath='{.items[0].metadata.name}')
+
+2) Inspect the current value in gibbonSetting
+kubectl -n "$NS" exec -it "$MYSQL_POD" -c mysql -- bash -lc '
+mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -D gibbon -e "
+  SELECT scope,name,value
+  FROM gibbonSetting
+  WHERE name IN (\"absoluteURL\") OR value LIKE \"http://thachcham.%\";
+"'
+
+3) Force it to HTTPS
+kubectl -n "$NS" exec -it "$MYSQL_POD" -c mysql -- bash -lc '
+mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -D gibbon -e "
+  UPDATE gibbonSetting
+     SET value = \"https://thachcham.vanhoa.edu.vn\"
+   WHERE scope = \"System\" AND name = \"absoluteURL\";
+  SELECT scope,name,value FROM gibbonSetting WHERE name=\"absoluteURL\";
+"'
+
+4) Clear app cache & restart the app
+APP=$(kubectl -n "$NS" get pod -l app=gibbon-thachcham \
+  -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk "NR==1{print}")
+kubectl -n "$NS" exec "$APP" -c gibbon -- sh -lc 'rm -rf /var/www/html/gibbon/uploads/cache/* || true'
+kubectl -n "$NS" rollout restart deploy/gibbon-thachcham-app
+kubectl -n "$NS" rollout status  deploy/gibbon-thachcham-app --timeout=300s
+
+5) Re-fetch HTML and confirm links are now HTTPS
+APP=$(kubectl -n "$NS" get pod -l app=gibbon-thachcham \
+  -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk "NR==1{print}")
+kubectl -n "$NS" exec "$APP" -c gibbon -- sh -lc \
+  'curl -s -H "Host: thachcham.vanhoa.edu.vn" http://127.0.0.1/ > /tmp/index.html && \
+   echo "Any http:// refs? (should be 0)"; \
+   grep -o "http://thachcham.vanhoa.edu.vn" /tmp/index.html | wc -l && \
+   echo "Sample CSS:" && \
+   grep -inE "<link[^>]*(stylesheet|text/css)" /tmp/index.html | head -n 5'
+
+## checking open ai key 
+- checking if the openai key token in secret is matching with the key used in pod
+NS="gibbon-dev-deploy"
+SEC="gibbon-dev-openai"
+APP_LABEL="app=gibbon-dev"
+
+echo "[1] Secret (masked):"
+SEC_MASKED=$(kubectl -n "$NS" get secret "$SEC" -o jsonpath='{.data.OPENAI_API_KEY}' \
+  | base64 -d | awk '{print substr($0,1,6)"…"(length>4?substr($0,length-3):$0)}')
+echo "    $SEC_MASKED"
+
+SEC_LAST4=$(echo "$SEC_MASKED" | awk -F'…' '{print substr($2,length($2)-3)}')
+
+echo "[2] Pods using the secret:"
+PODS=$(kubectl -n "$NS" get pod -l "$APP_LABEL" \
+  -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}')
+for p in $PODS; do
+  echo " - $p"
+  echo "   mounted file last4: \c"
+  kubectl -n "$NS" exec "$p" -c gibbon -- sh -lc 'tail -c 4 /run/secrets/openai/OPENAI_API_KEY 2>/dev/null || echo MISSING'
+
+  echo "   PHP getApiKey() last4: \c"
+  kubectl -n "$NS" exec "$p" -c gibbon -- sh -lc '
+    cat >/var/www/html/gibbon/_whichkey.php <<'"'"'PHP'"'"'
+    <?php
+      require __DIR__."/openai.php";
+      $k = function_exists("getApiKey") ? getApiKey(false) : null;
+      echo $k ? substr($k,-4) : "MISSING";
+    PHP
+    php -d display_errors=0 /var/www/html/gibbon/_whichkey.php 2>/dev/null || true
+    rm -f /var/www/html/gibbon/_whichkey.php 2>/dev/null || true
+    echo
+  '
+done
+
+echo "[3] Expect last4 = $SEC_LAST4"
+
+
+# *************** NUKE DEPLOYMENT - PROCEED WITH CAUTION - IRREVERSIBLE****************
+
+## Back up database, files if needed 
+## Back up database, files if needed (AGAIN)
